@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 const schema = 'notmeter-settings-cache-v1';
 const maxBytes = 512 * 1024 * 1024;
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
-const safePath = value => /^(?:entries\/[a-f0-9]{64}|(?:kr|tw|ww)\/[a-f0-9]{2})\.json\.gz$/.test(value);
+const safePath = value => /^(?:entries\/[a-f0-9]{64}|catalog\/[0-9]{4}|(?:kr|tw|ww)\/[a-f0-9]{2})\.json\.gz$/.test(value);
 const assert = (condition, message) => { if (!condition) throw Error(message); };
 
 export function verify(manifest, bundle) {
@@ -16,7 +16,8 @@ export function verify(manifest, bundle) {
     Number.isSafeInteger(manifest.generatedAt) && manifest.generatedAt > 0 &&
     Number.isSafeInteger(manifest.count) && manifest.count >= 0 && manifest.count <= 100000 &&
     Number.isSafeInteger(manifest.totalBytes) && manifest.totalBytes <= maxBytes &&
-    Array.isArray(manifest.files) && manifest.files.length <= 768, 'Invalid settings manifest');
+    Array.isArray(manifest.files) && manifest.files.length <= 768 &&
+    (manifest.catalog == null || Array.isArray(manifest.catalog) && manifest.catalog.length <= 200), 'Invalid settings manifest');
   assert(bundle.length === manifest.bundleSize && bundle.length <= 700000000 && digest(bundle) === manifest.bundleSha256, 'Invalid bundle hash or size');
   const files = new Map(); let total = 0;
   for (let offset = 0; offset + 512 <= bundle.length;) {
@@ -28,7 +29,7 @@ export function verify(manifest, bundle) {
       parseInt(checksum,8) === sum && [0,48].includes(header[156]) && text(157,257) === '' && text(345,500) === '', 'Invalid tar entry');
     const size = parseInt(sizeText,8); assert(size > 0 && size <= 1048576 && offset + 512 + size <= bundle.length, 'Invalid tar entry length');
     const bytes = bundle.subarray(offset+512,offset+512+size);
-    total += size; assert(total <= maxBytes && files.size <= 100768, 'Cache exceeds storage budget');
+    total += size; assert(total <= maxBytes && files.size <= 100968, 'Cache exceeds storage budget');
     files.set(name, bytes); offset += 512 + Math.ceil(size/512)*512;
   }
   assert(total === manifest.totalBytes, 'Incomplete bundle');
@@ -40,6 +41,7 @@ export function verify(manifest, bundle) {
     const value = JSON.parse(gunzipSync(bytes,{ maxOutputLength: 2097152 })); assert(value.schema === schema, 'Invalid document schema'); return value;
   }
   const documents = new Set();
+  const identities = new Map();
   for (const file of manifest.files) {
     assert(/^(kr|tw|ww)\/[a-f0-9]{2}\.json\.gz$/.test(file.path), 'Invalid index path');
     const index = read(file); assert(index.entries && typeof index.entries === 'object', 'Invalid index');
@@ -50,6 +52,8 @@ export function verify(manifest, bundle) {
         file.path === `${entry.region.toLowerCase()}/${key.slice(0,2)}.json.gz` &&
         Number.isSafeInteger(entry.updatedAt) && entry.updatedAt > 0 && entry.updatedAt <= manifest.generatedAt, 'Invalid character identity');
       assert(entry.file.path === `entries/${entry.file.sha256}.json.gz`, 'Invalid content address');
+      assert(!identities.has(key), 'Duplicate character');
+      identities.set(key, entry);
       if (!documents.has(entry.file.path)) {
         const doc = read(entry.file);
         assert(/^NM-SETTINGS-2:[A-Za-z0-9_-]{48,24000}$/.test(doc.settingsCode) && Array.isArray(doc.groups) &&
@@ -60,8 +64,24 @@ export function verify(manifest, bundle) {
       count++;
     }
   }
+  if (manifest.catalog != null) {
+    const seen = new Set();
+    for (const [i, file] of manifest.catalog.entries()) {
+      assert(file.path === `catalog/${String(i).padStart(4,'0')}.json.gz`, 'Invalid catalog path');
+      const catalog = read(file);
+      assert(Array.isArray(catalog.entries) && catalog.entries.length > 0 && catalog.entries.length <= 500, 'Invalid catalog');
+      for (const entry of catalog.entries) {
+        const key = digest(`${entry.region}:${entry.serverId}:${entry.characterId}`);
+        assert(!seen.has(key) && JSON.stringify(identities.get(key)) === JSON.stringify(entry) &&
+          Number.isSafeInteger(entry.likes) && entry.likes >= 0 &&
+          ['','검성','수호성','살성','궁성','마도성','정령성','치유성','호법성','권성'].includes(entry.job), 'Invalid gallery entry');
+        seen.add(key);
+      }
+    }
+    assert(seen.size === count, 'Incomplete gallery');
+  }
   assert(count === manifest.count && referenced.size === files.size, 'Unreferenced or missing files');
-  assert(digest(manifest.files.map(f=>`${f.path}:${f.sha256}`).join('\n')).slice(0,32) === manifest.generation, 'Generation mismatch');
+  assert(digest([...manifest.files,...(manifest.catalog || [])].map(f=>`${f.path}:${f.sha256}`).join('\n')).slice(0,32) === manifest.generation, 'Generation mismatch');
   return files;
 }
 
