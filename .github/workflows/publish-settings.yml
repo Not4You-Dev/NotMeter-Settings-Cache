@@ -1,0 +1,58 @@
+name: Publish verified settings
+on:
+  push:
+    branches: [main]
+    paths: ['build-pages.mjs', 'resolve-pointer.mjs', '.github/workflows/publish-settings.yml']
+  repository_dispatch:
+    types: [settings-cache-updated]
+  workflow_dispatch:
+concurrency:
+  group: settings-pages
+  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: write
+  pages: write
+  id-token: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Resolve mutable release pointer
+        id: pointer
+        run: node resolve-pointer.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: actions/configure-pages@v5
+        if: steps.pointer.outputs.ready == 'true'
+      - name: Verify and assemble public settings
+        run: node build-pages.mjs
+        if: steps.pointer.outputs.ready == 'true'
+      - uses: actions/upload-pages-artifact@v3
+        id: artifact
+        if: steps.pointer.outputs.ready == 'true'
+        with:
+          path: _site
+          retention-days: 1
+      - uses: actions/deploy-pages@v4
+        if: steps.pointer.outputs.ready == 'true'
+        id: deployment
+      - name: Remove temporary deployment artifact
+        if: always() && steps.artifact.outputs.artifact_id != ''
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          ARTIFACT_ID: ${{ steps.artifact.outputs.artifact_id }}
+        with:
+          script: |
+            const artifact_id = Number(process.env.ARTIFACT_ID);
+            if (!Number.isSafeInteger(artifact_id) || artifact_id <= 0) throw new Error('Invalid artifact ID');
+            await github.rest.actions.deleteArtifact({ ...context.repo, artifact_id });
