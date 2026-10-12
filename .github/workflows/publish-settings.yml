@@ -33,6 +33,12 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: actions/configure-pages@v5
         if: steps.pointer.outputs.ready == 'true'
+      - uses: actions/cache@v4
+        if: steps.pointer.outputs.ready == 'true'
+        with:
+          path: .settings-metadata
+          key: settings-metadata-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: settings-metadata-
       - name: Verify and assemble public settings
         run: node build-pages.mjs
         if: steps.pointer.outputs.ready == 'true'
