@@ -102,6 +102,10 @@ export async function build({ source = '.', destination = '_site', bundleFile } 
   await fs.mkdir(destination,{recursive:true});
   assert((await fs.readdir(destination)).length===0,'Output must be empty');
   for(const [relative,bytes] of files){const file=path.join(destination,relative);await fs.mkdir(path.dirname(file),{recursive:true});await fs.writeFile(file,bytes);}
+  await fs.mkdir(path.join(destination,'objects'),{recursive:true});
+  for(const file of [...manifest.files,...(manifest.catalog || [])]){
+    await fs.writeFile(path.join(destination,'objects',`${file.sha256}.json.gz`),files.get(file.path));
+  }
   await fs.writeFile(path.join(destination,'manifest.json'),manifestBytes);
   await fs.writeFile(path.join(destination,'.nojekyll'),'');
   console.log(JSON.stringify({generation:manifest.generation,characters:manifest.count,files:files.size,bytes:manifest.totalBytes}));
