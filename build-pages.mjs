@@ -85,7 +85,7 @@ export function verify(manifest, bundle) {
   return files;
 }
 
-export async function build({ source = '.', destination = '_site', bundleFile } = {}) {
+export async function build({ source = '.', destination = '_site', bundleFile, metadataCache = '.settings-metadata' } = {}) {
   const manifestBytes = await fs.readFile(path.join(source,'manifest.json')); assert(manifestBytes.length <= 262144, 'Manifest too large');
   const manifest = JSON.parse(manifestBytes);
   assert(['settings-a','settings-b'].includes(manifest.tag) && /^settings-[a-f0-9]{32}\.tar$/.test(manifest.bundleName), 'Invalid release pointer');
@@ -99,15 +99,35 @@ export async function build({ source = '.', destination = '_site', bundleFile } 
     bundle=Buffer.concat(chunks);
   }
   const files=verify(manifest,bundle);
+  const current=[...manifest.files,...(manifest.catalog || [])].map(file=>({sha256:file.sha256,size:file.size,data:files.get(file.path).toString('base64')}));
+  let previous=[];
+  const stateFile=path.join(metadataCache,'state.json');
+  try{
+    const stat=await fs.stat(stateFile);assert(stat.size<=maxBytes,'Metadata history too large');
+    const saved=JSON.parse(await fs.readFile(stateFile,'utf8'));
+    if(saved.generation!==manifest.generation)previous=saved.current;
+    else previous=saved.previous;
+    assert(Array.isArray(previous)&&previous.length<=968,'Invalid metadata history');
+  }catch(error){if(error.code!=='ENOENT')throw error;}
+  const objects=new Map();
+  for(const file of [...previous,...current]){
+    assert(/^[a-f0-9]{64}$/.test(file.sha256)&&Number.isSafeInteger(file.size)&&file.size>0&&file.size<=1048576&&typeof file.data==='string'&&file.data.length<=1398104,'Invalid metadata object');
+    const bytes=Buffer.from(file.data,'base64');
+    assert(bytes.length===file.size&&digest(bytes)===file.sha256,'Invalid metadata history hash');
+    objects.set(file.sha256,bytes);
+  }
+  assert(manifest.totalBytes+[...objects.values()].reduce((n,b)=>n+b.length,0)+manifestBytes.length<1000000000,'Pages storage budget exceeded');
   await fs.mkdir(destination,{recursive:true});
   assert((await fs.readdir(destination)).length===0,'Output must be empty');
   for(const [relative,bytes] of files){const file=path.join(destination,relative);await fs.mkdir(path.dirname(file),{recursive:true});await fs.writeFile(file,bytes);}
   await fs.mkdir(path.join(destination,'objects'),{recursive:true});
-  for(const file of [...manifest.files,...(manifest.catalog || [])]){
-    await fs.writeFile(path.join(destination,'objects',`${file.sha256}.json.gz`),files.get(file.path));
+  for(const [hash,bytes] of objects){
+    await fs.writeFile(path.join(destination,'objects',`${hash}.json.gz`),bytes);
   }
   await fs.writeFile(path.join(destination,'manifest.json'),manifestBytes);
   await fs.writeFile(path.join(destination,'.nojekyll'),'');
+  await fs.mkdir(metadataCache,{recursive:true});
+  await fs.writeFile(stateFile,JSON.stringify({generation:manifest.generation,current,previous}));
   console.log(JSON.stringify({generation:manifest.generation,characters:manifest.count,files:files.size,bytes:manifest.totalBytes}));
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(path.resolve(process.argv[1])).href) await build({source:process.argv[2]||'.',destination:process.argv[3]||'_site',bundleFile:process.argv[4]});
