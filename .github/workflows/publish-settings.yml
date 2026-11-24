@@ -17,7 +17,7 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -48,11 +48,79 @@ jobs:
         with:
           path: _site
           retention-days: 1
-      - uses: actions/deploy-pages@v4
+      - name: Deploy the verified artifact from this run
         if: steps.pointer.outputs.ready == 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         id: deployment
+        env:
+          PAGES_ARTIFACT_ID: ${{ steps.artifact.outputs.artifact_id }}
+        with:
+          retries: 0
+          script: |
+            const id = process.env.PAGES_ARTIFACT_ID;
+            const run = context.runId, sha = context.sha;
+            if (!/^[1-9]\d*$/.test(id || '') || !Number.isSafeInteger(Number(id)) ||
+                !Number.isSafeInteger(run) || !/^[0-9a-f]{40}$/.test(sha) || context.ref !== 'refs/heads/main')
+              throw Error('Invalid cache publication identity.');
+            const params = { ...context.repo, request: { timeout: 20000, retries: 0 } };
+            const wait = n => new Promise(done => setTimeout(done, n));
+            const transient = e => !e.status || [404, 408, 429, 500, 502, 503, 504].includes(e.status);
+            let artifact;
+            for (let i = 0; i < 8; i++) {
+              try {
+                artifact = (await github.request('GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}',
+                  { ...params, artifact_id: id })).data;
+                break;
+              } catch (e) {
+                if (!transient(e) || i === 7) throw Error('Cannot confirm uploaded cache artifact: HTTP ' + (e.status || 'unavailable'));
+                await wait(Math.min(1000 * 2 ** i, 12000));
+              }
+            }
+            if (String(artifact?.id) !== id || artifact.name !== 'github-pages' || artifact.expired !== false ||
+                !Number.isSafeInteger(artifact.size_in_bytes) || artifact.size_in_bytes < 1 ||
+                artifact.workflow_run?.id !== run || artifact.workflow_run.head_sha !== sha ||
+                artifact.workflow_run.head_branch !== 'main' || !Number.isSafeInteger(artifact.workflow_run.repository_id) ||
+                artifact.workflow_run.repository_id !== artifact.workflow_run.head_repository_id ||
+                String(artifact.workflow_run.repository_id) !== process.env.GITHUB_REPOSITORY_ID)
+              throw Error('Uploaded artifact identity, size, or revision mismatch.');
+            const oidc = await core.getIDToken();
+            if (typeof oidc !== 'string' || !oidc) throw Error('Missing workflow identity.');
+            let created;
+            try {
+              created = (await github.request('POST /repos/{owner}/{repo}/pages/deployments',
+                { ...params, artifact_id: Number(id), pages_build_version: sha, oidc_token: oidc })).data;
+            } catch (e) {
+              throw Error('Cache Pages deployment was not confirmed; not resubmitting: HTTP ' + (e.status || 'unavailable'));
+            }
+            const deployment = String(created?.id || sha);
+            if (!/^(?:[1-9]\d*|[0-9a-f]{40})$/.test(deployment) ||
+                typeof created?.page_url !== 'string' || !created.page_url || /[\s\\]/.test(created.page_url))
+              throw Error('Invalid cache Pages deployment receipt.');
+            const pageUrl = new URL(created.page_url.includes('://') ? created.page_url : 'https://' + created.page_url);
+            if (pageUrl.protocol !== 'https:' || pageUrl.username || pageUrl.password) throw Error('Invalid cache Pages URL.');
+            const target = { ...params, deployment };
+            const end = Date.now() + 600000;
+            const failed = new Set(['deployment_failed','deployment_perms_error','deployment_content_failed','deployment_cancelled','deployment_lost']);
+            while (Date.now() < end) {
+              let status;
+              try {
+                status = (await github.request('GET /repos/{owner}/{repo}/pages/deployments/{deployment}', target)).data.status;
+              } catch (e) {
+                if (!transient(e)) throw Error('Cache Pages status unavailable: HTTP ' + (e.status || 'unavailable'));
+              }
+              if (status === 'succeed') {
+                core.setOutput('page_url', pageUrl.href);
+                core.info('Cache Pages deployment verified for artifact ' + id + ' at ' + sha);
+                return;
+              }
+              if (failed.has(status)) throw Error('Cache Pages status: ' + status);
+              await wait(5000);
+            }
+            try { await github.request('POST /repos/{owner}/{repo}/pages/deployments/{deployment}/cancel', target); }
+            catch (e) { core.warning('Cache Pages cancellation unconfirmed: HTTP ' + (e.status || 'unavailable')); }
+            throw Error('Cache Pages status was not successful before the deadline.');
       - name: Remove temporary deployment artifact
-        if: always() && steps.artifact.outputs.artifact_id != ''
+        if: success() && steps.deployment.outcome == 'success' && steps.artifact.outputs.artifact_id != ''
         continue-on-error: true
         uses: actions/github-script@v7
         env:
